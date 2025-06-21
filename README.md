@@ -37,6 +37,7 @@ MADDPG extends the DDPG algorithm to multi-agent environments by using:
 
 #### Agent Architecture (`maddpg_agent.py`)
 - Single agent managing multiple environment entities
+- **Prioritized Experience Replay (PER)** for improved sample efficiency
 - Shared experience replay buffer for all agents
 - Ornstein-Uhlenbeck noise process for exploration
 - Soft target network updates for training stability
@@ -75,6 +76,9 @@ TAU = 1e-3                # Soft update parameter
 LR_ACTOR = 1e-4           # Actor learning rate
 LR_CRITIC = 1e-3          # Critic learning rate
 WEIGHT_DECAY = 0          # L2 weight decay
+PRIORITIZED_REPLAY = True  # Use Prioritized Experience Replay
+ALPHA = 0.6               # PER alpha (prioritization strength)
+BETA = 0.4                # PER beta (importance sampling)
 ```
 
 ## Results
@@ -103,70 +107,136 @@ The agent successfully solved the environment in **1,260 episodes**, achieving a
 2. **Learning Phase (Episodes 900-1200)**: Gradual improvement as agents discover cooperative strategies  
 3. **Breakthrough Phase (Episodes 1300+)**: Rapid convergence once effective collaboration emerges
 
-**Why MADDPG Took Time to Learn**:
+**Why MADDPG with PER Succeeded**:
+- **Prioritized learning**: PER helped focus on important experiences, accelerating learning
 - **Multi-agent complexity**: Two agents must learn to coordinate actions simultaneously
 - **Sparse rewards**: Tennis environment provides limited positive feedback initially
 - **Continuous action space**: More challenging than discrete actions
 - **Cooperative requirement**: Both agents must perform well for sustained rallies
 
-The final breakthrough at episode 1300 (jumping from 0.0258 to 0.2480) demonstrates the sudden emergence of cooperative behavior typical in multi-agent reinforcement learning.
+The use of Prioritized Experience Replay likely contributed to the relatively efficient learning (1,260 episodes), as it allows the agent to replay the most informative experiences more frequently. The final breakthrough at episode 1300 demonstrates the sudden emergence of cooperative behavior typical in multi-agent reinforcement learning.
 
 ## File Structure
 
 ```
-├── maddpg_agent.py          # Main agent implementation
-├── model.py                 # Neural network architectures
-├── Tennis.ipynb             # Training notebook
-├── checkpoint_actor.pth     # Trained actor weights
-├── checkpoint_critic.pth    # Trained critic weights
-└── README.md               # This file
+├── maddpg_agent.py                # Main agent implementation with PER
+├── model.py                       # Neural network architectures
+├── Tennis.ipynb                   # Training notebook
+├── checkpoint_actor.pth           # Latest actor weights
+├── checkpoint_critic.pth          # Latest critic weights
+├── solved_checkpoint_actor.pth    # Solved actor weights
+├── solved_checkpoint_critic.pth   # Solved critic weights
+├── img.png                        # Training results plot
+└── README.md                      # This file
 ```
 
 ## Usage
 
-### Training
+### Training Implementation
 ```python
 from maddpg_agent import Agent
 
 # Initialize agent
-agent = Agent(state_size=24, action_size=2, num_agents=2, random_seed=42)
+agent = Agent(state_size=state_size, action_size=action_size, 
+              num_agents=num_agents, random_seed=1)
 
-# Training loop
-for episode in range(max_episodes):
-    states = env.reset()
-    scores = np.zeros(num_agents)
+def maddpg(n_episodes=6000, max_t=300, print_every=100):
+    scores_deque = deque(maxlen=print_every)
+    scores = []
+    mean_scores = []   
     
-    while True:
-        actions = agent.act(states, add_noise=True)
-        next_states, rewards, dones = env.step(actions)
-        agent.step(states, actions, rewards, next_states, dones)
+    for i_episode in range(1, n_episodes+1):
+        env_info = env.reset(train_mode=True)[brain_name]
+        state = env_info.vector_observations
+        agent.reset()
+        score = np.zeros(num_agents)
         
-        states = next_states
-        scores += rewards
+        for t in range(max_t):
+            # Get actions from both agents
+            action1 = agent.act(state[0])
+            action2 = agent.act(state[1])
+            action = np.concatenate((action1, action2), axis=0)
+            action = np.clip(action, -1, 1)
+            
+            # Environment step
+            env_info = env.step(action)[brain_name]
+            next_state = env_info.vector_observations
+            reward = env_info.rewards
+            done = env_info.local_done
+            
+            # Agent learning step
+            agent.step(state, action, reward, next_state, done)
+            state = next_state
+            score += reward
+            
+            if np.any(done):
+                break
         
-        if np.any(dones):
+        # Track scores and save checkpoints
+        scores_deque.append(np.max(score))
+        scores.append(np.max(score))    
+        mean_scores.append(np.mean(scores_deque))
+        
+        # Save checkpoints every episode
+        torch.save(agent.actor_local.state_dict(), 'checkpoint_actor.pth')
+        torch.save(agent.critic_local.state_dict(), 'checkpoint_critic.pth')
+        
+        # Print progress
+        print('\rEpisode {}\tAverage Score: {:.4f}'.format(
+            i_episode, np.mean(scores_deque)), end="")
+        if i_episode % print_every == 0:
+            print('\rEpisode {}\tAverage Score: {:.4f}'.format(
+                i_episode, np.mean(scores_deque)))
+        
+        # Check if solved
+        if np.mean(scores_deque) > 0.5:
+            torch.save(agent.actor_local.state_dict(), 'solved_checkpoint_actor.pth')
+            torch.save(agent.critic_local.state_dict(), 'solved_checkpoint_critic.pth')
+            print('\nEnvironment solved in {:d} episodes!\tAverage Score: {:.4f}'.format(
+                i_episode-100, np.mean(scores_deque)))
             break
+    
+    return scores, mean_scores
+
+# Run training
+scores, mean_scores = maddpg()
 ```
 
 ### Testing
 ```python
-# Load trained weights
-agent.load_checkpoint('checkpoint_actor.pth')
+# Initialize agent and load trained weights
+agent = Agent(state_size=state_size, action_size=action_size, 
+              num_agents=num_agents, random_seed=1)
+agent.actor_local.load_state_dict(torch.load('checkpoint_actor.pth'))
+agent.critic_local.load_state_dict(torch.load('checkpoint_critic.pth'))
 
-# Test performance
-for episode in range(test_episodes):
-    states = env.reset()
-    scores = np.zeros(num_agents)
+# Reset environment for testing
+env_info = env.reset(train_mode=False)[brain_name]     
+states = env_info.vector_observations                  
+scores = np.zeros(num_agents)                          
+
+while True:
+    # Get actions from both agents (no exploration noise)
+    action1 = agent.act(states[0])
+    action2 = agent.act(states[1])
+    action = np.concatenate((action1, action2), axis=0)
+    action = np.clip(action, -1, 1)             
     
-    while True:
-        actions = agent.act(states, add_noise=False)  # No exploration
-        next_states, rewards, dones = env.step(actions)
-        
-        states = next_states
-        scores += rewards
-        
-        if np.any(dones):
-            break
+    # Environment step
+    env_info = env.step(action)[brain_name]           
+    next_states = env_info.vector_observations         
+    rewards = env_info.rewards                         
+    dones = env_info.local_done                        
+    
+    # Update scores and states
+    scores += env_info.rewards                         
+    states = next_states                               
+    
+    if np.any(dones):                                  
+        break
+
+print('Score (max over agents) from this episode: {}'.format(np.max(scores)))
+# Output: Score (max over agents) from this episode: 2.600000038743019
 ```
 
 ## Key Features
@@ -179,6 +249,7 @@ for episode in range(test_episodes):
 - **Checkpointing**: Save/load model states for reproducibility
 
 ### Algorithm Improvements
+- **Prioritized Experience Replay (PER)**: Focuses learning on important experiences with high TD errors
 - **Proper Weight Initialization**: Xavier initialization for stable training
 - **Gradient Clipping**: Prevents exploding gradients
 - **Batch Normalization**: Improved training stability
